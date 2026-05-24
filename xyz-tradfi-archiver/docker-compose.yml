@@ -11,6 +11,11 @@ services:
     env_file: .env
     volumes:
       - archiver-state:/var/lib/xyz-tradfi-archiver
+    logging:
+      driver: local
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   writer:
     build:
@@ -22,6 +27,11 @@ services:
     env_file: .env
     volumes:
       - archiver-state:/var/lib/xyz-tradfi-archiver
+    logging:
+      driver: local
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   validator:
     build:
@@ -39,6 +49,11 @@ services:
       timeout: 30s
       retries: 3
       start_period: 15m
+    logging:
+      driver: local
+      options:
+        max-size: "50m"
+        max-file: "5"
 
 volumes:
   archiver-state:
