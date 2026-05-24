@@ -53,9 +53,8 @@ def run_writer(settings: Settings) -> None:
     )
 
     logger.info(
-        "spool_ready sealed_dir=%s done_dir=%s failed_dir=%s",
+        "spool_ready sealed_dir=%s failed_dir=%s",
         spool.sealed_dir,
-        spool.done_dir,
         spool.failed_dir,
     )
 
@@ -70,6 +69,7 @@ def run_writer(settings: Settings) -> None:
 
         if not segments:
             current_ms = int(time.time() * 1000)
+
             if current_ms - last_idle_log_ms >= 30_000:
                 logger.info("writer_idle no_sealed_segments=true sealed_dir=%s", spool.sealed_dir)
                 last_idle_log_ms = current_ms
@@ -80,6 +80,8 @@ def run_writer(settings: Settings) -> None:
         logger.info("sealed_segments_found count=%s", len(segments))
 
         for segment in segments:
+            segment_uploaded = False
+
             try:
                 logger.info("segment_start path=%s", segment)
 
@@ -99,15 +101,7 @@ def run_writer(settings: Settings) -> None:
                     len(events),
                 )
 
-                done_path = spool.mark_done(segment)
-
-                logger.info(
-                    "segment_done source=%s destination=%s events=%s",
-                    segment,
-                    done_path,
-                    len(events),
-                )
-
+                segment_uploaded = True
                 wrote_any = True
 
             except Exception as exc:
@@ -126,6 +120,37 @@ def run_writer(settings: Settings) -> None:
                     "segment_failed source=%s destination=%s error=%r",
                     segment,
                     failed_path,
+                    exc,
+                )
+
+            if not segment_uploaded:
+                continue
+
+            try:
+                spool.delete_processed(segment)
+
+                logger.info(
+                    "segment_cleaned source=%s events=%s",
+                    segment,
+                    len(events),
+                )
+
+            except Exception as exc:
+                logger.exception("segment_cleanup_error path=%s", segment)
+
+                metadata_store.record_health(
+                    event_type="segment_cleanup_error",
+                    severity="error",
+                    message=repr(exc),
+                    details_json=dumps({"segment": str(segment)}),
+                )
+
+                done_path = spool.mark_done(segment)
+
+                logger.error(
+                    "segment_retained_after_cleanup_error source=%s destination=%s error=%r",
+                    segment,
+                    done_path,
                     exc,
                 )
 
