@@ -22,19 +22,31 @@ class BrutWriter:
     def write_segment(self, segment: Path) -> list[RawEvent]:
         events = self._read_events(segment)
         grouped: dict[str, list[RawEvent]] = defaultdict(list)
+
         for event in events:
             grouped[event.object_partition(root="brut")].append(event)
 
         segment_id = segment.name.replace(".sealed.jsonl", "")
+
         with TemporaryDirectory() as tmp_dir_raw:
             tmp_dir = Path(tmp_dir_raw)
+
             for partition, partition_events in grouped.items():
                 key = f"{partition}/part-{segment_id}.jsonl.zst"
                 path = tmp_dir / (sha256(key.encode("utf-8")).hexdigest() + ".jsonl.zst")
-                checksum = self._write_zst(path=path, events=partition_events)
-                self.object_store.put_file(key=key, path=path, content_type="application/zstd")
+
+                self._write_zst(path=path, events=partition_events)
+                checksum = sha256(path.read_bytes()).hexdigest()
+
+                self.object_store.put_file(
+                    key=key,
+                    path=path,
+                    content_type="application/zstd",
+                )
+
                 min_event_ts_ms = min(event.event_ts_ms for event in partition_events)
                 max_event_ts_ms = max(event.event_ts_ms for event in partition_events)
+
                 self.metadata_store.record_object(
                     key=key,
                     kind="brut",
@@ -44,6 +56,7 @@ class BrutWriter:
                     min_event_ts_ms=min_event_ts_ms,
                     max_event_ts_ms=max_event_ts_ms,
                 )
+
                 write_object_manifest(
                     object_store=self.object_store,
                     object_key=key,
@@ -54,25 +67,30 @@ class BrutWriter:
                     min_event_ts_ms=min_event_ts_ms,
                     max_event_ts_ms=max_event_ts_ms,
                 )
+
         return events
 
     def _read_events(self, segment: Path) -> list[RawEvent]:
         events: list[RawEvent] = []
+
         with segment.open("r", encoding="utf-8") as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle, start=1):
                 line = line.strip()
                 if not line:
                     continue
-                events.append(RawEvent.model_validate(loads(line)))
+
+                payload = loads(line)
+                if not isinstance(payload, dict):
+                    raise RuntimeError(f"invalid raw event at {segment}:{line_number}")
+
+                events.append(RawEvent(**payload))
+
         return events
 
-    def _write_zst(self, *, path: Path, events: list[RawEvent]) -> str:
-        digest = sha256()
+    def _write_zst(self, *, path: Path, events: list[RawEvent]) -> None:
         compressor = zstd.ZstdCompressor(level=6)
+
         with path.open("wb") as raw_file:
             with compressor.stream_writer(raw_file) as writer:
                 for event in events:
-                    encoded = event.line().encode("utf-8")
-                    digest.update(encoded)
-                    writer.write(encoded)
-        return digest.hexdigest()
+                    writer.write(event.line().encode("utf-8"))

@@ -49,8 +49,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "validate-once":
-        print(json.dumps(validate_once(settings), indent=2, sort_keys=True), flush=True)
-        return 0
+        report = validate_once(settings)
+        print(json.dumps(report, indent=2, sort_keys=True, default=str), flush=True)
+        return 0 if report.get("status") == "ok" else 1
 
     if args.command == "validate-loop":
         validate_loop(settings)
@@ -64,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
             "latest_objects": metadata_store.latest_objects(limit=20),
             "latest_health": metadata_store.latest_health(limit=20),
         }
-        print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str), flush=True)
         return 0
 
     return 2

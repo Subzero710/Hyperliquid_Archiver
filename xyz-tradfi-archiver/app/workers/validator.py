@@ -15,7 +15,7 @@ logger = logging.getLogger("xyz_archiver.validator")
 
 def validate_once(settings: Settings, *, started_at_s: float | None = None) -> dict[str, Any]:
     now_s = time.time()
-    started_at_s = started_at_s or now_s
+    started_at_s = _validator_started_at_s(settings=settings, override=started_at_s)
     runtime_s = max(0, int(now_s - started_at_s))
 
     spool_dir = settings.spool_dir
@@ -47,8 +47,8 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
 
     metadata_ok = True
     object_count = 0
-    latest_objects: list[Any] = []
-    latest_health: list[Any] = []
+    latest_objects: list[dict[str, Any]] = []
+    latest_health: list[dict[str, Any]] = []
 
     try:
         metadata_store = MetadataStore(settings.metadata_db_path)
@@ -65,12 +65,12 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
             }
         )
 
-    if failed_segments_count := len(failed_segments):
-        status = "error" if failed_segments_count > settings.validator_max_failed_segments else "ok"
+    failed_segments_count = len(failed_segments)
+    if failed_segments_count > settings.validator_max_failed_segments:
         checks.append(
             {
                 "name": "failed_segments",
-                "status": status,
+                "status": "error",
                 "count": failed_segments_count,
                 "max": settings.validator_max_failed_segments,
                 "files": [str(path) for path in failed_segments[:10]],
@@ -133,7 +133,6 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
         )
 
     errors = [check for check in checks if check.get("status") == "error"]
-
     status = "ok" if not errors and metadata_ok and object_store_ok else "error"
 
     report = {
@@ -155,6 +154,17 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
         "latest_health": latest_health,
     }
 
+    if metadata_ok:
+        try:
+            metadata_store.record_health(
+                event_type="validator_report",
+                severity="info" if status == "ok" else "error",
+                message=f"validator status={status}",
+                details_json=json.dumps(report, sort_keys=True, default=str),
+            )
+        except Exception:
+            logger.exception("validator_record_health_error")
+
     if status == "ok":
         logger.info(
             "validator_ok object_count=%s open=%s sealed=%s done=%s failed=%s",
@@ -171,7 +181,7 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
 
 
 def validate_loop(settings: Settings) -> None:
-    started_at_s = time.time()
+    started_at_s = _validator_started_at_s(settings=settings, override=None)
 
     logger.info(
         "validator_start db=%s interval_s=%s grace_s=%s",
@@ -183,6 +193,24 @@ def validate_loop(settings: Settings) -> None:
     while True:
         validate_once(settings, started_at_s=started_at_s)
         time.sleep(settings.validator_loop_sleep_seconds)
+
+
+def _validator_started_at_s(*, settings: Settings, override: float | None) -> float:
+    if override is not None:
+        return override
+
+    marker = settings.archiver_state_dir / ".validator_started_at"
+    settings.archiver_state_dir.mkdir(parents=True, exist_ok=True)
+
+    if marker.exists():
+        try:
+            return float(marker.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pass
+
+    started_at_s = time.time()
+    marker.write_text(str(started_at_s), encoding="utf-8")
+    return started_at_s
 
 
 def _list_files(path: Path) -> list[Path]:

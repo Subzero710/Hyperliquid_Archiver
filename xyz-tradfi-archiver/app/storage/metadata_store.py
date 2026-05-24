@@ -1,94 +1,75 @@
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
-from typing import Any
+import argparse
+import json
+import logging
+import sys
 
-from app.utils.time import now_ms
+from app.config import Settings
+from app.logging_config import configure_logging
+from app.storage.metadata_store import MetadataStore
+from app.workers.recorder import run_recorder
+from app.workers.validator import validate_loop, validate_once
+from app.workers.writer import run_writer
+
+logger = logging.getLogger("xyz_archiver.cli")
 
 
-class MetadataStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(str(path), isolation_level=None)
-        self.connection.row_factory = sqlite3.Row
-        self._init_schema()
+def main(argv: list[str] | None = None) -> int:
+    configure_logging()
 
-    def record_object(
-        self,
-        *,
-        key: str,
-        kind: str,
-        source_segment: str,
-        row_count: int,
-        checksum_sha256: str,
-        min_event_ts_ms: int | None,
-        max_event_ts_ms: int | None,
-    ) -> None:
-        self.connection.execute(
-            """
-            insert into archive_object(
-              key, kind, source_segment, row_count, checksum_sha256,
-              min_event_ts_ms, max_event_ts_ms, created_at_ms
-            ) values (?, ?, ?, ?, ?, ?, ?, ?)
-            on conflict(key) do update set
-              row_count = excluded.row_count,
-              checksum_sha256 = excluded.checksum_sha256,
-              min_event_ts_ms = excluded.min_event_ts_ms,
-              max_event_ts_ms = excluded.max_event_ts_ms
-            """,
-            (key, kind, source_segment, row_count, checksum_sha256, min_event_ts_ms, max_event_ts_ms, now_ms()),
-        )
+    parser = argparse.ArgumentParser(prog="xyz-archiver")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    def record_health(self, *, event_type: str, severity: str, message: str, details_json: str) -> None:
-        self.connection.execute(
-            """
-            insert into archive_health(event_type, severity, message, details_json, created_at_ms)
-            values (?, ?, ?, ?, ?)
-            """,
-            (event_type, severity, message, details_json, now_ms()),
-        )
+    subparsers.add_parser("record")
+    subparsers.add_parser("write")
+    subparsers.add_parser("validate-once")
+    subparsers.add_parser("validate-loop")
+    subparsers.add_parser("inspect")
 
-    def object_count(self) -> int:
-        row = self.connection.execute("select count(*) as n from archive_object").fetchone()
-        return int(row["n"])
+    args = parser.parse_args(argv)
+    settings = Settings.from_env()
 
-    def latest_objects(self, *, limit: int) -> list[dict[str, Any]]:
-        rows = self.connection.execute(
-            "select * from archive_object order by created_at_ms desc limit ?",
-            (limit,),
-        ).fetchall()
-        return [dict(row) for row in rows]
+    logger.info(
+        "starting command=%s run_id=%s state_dir=%s bucket=%s endpoint=%s dex=%s",
+        args.command,
+        settings.archiver_run_id,
+        settings.archiver_state_dir,
+        settings.archive_bucket,
+        settings.archive_s3_endpoint,
+        settings.hyperliquid_dex,
+    )
 
-    def latest_health(self, *, limit: int) -> list[dict[str, Any]]:
-        rows = self.connection.execute(
-            "select * from archive_health order by created_at_ms desc limit ?",
-            (limit,),
-        ).fetchall()
-        return [dict(row) for row in rows]
+    if args.command == "record":
+        run_recorder(settings)
+        return 0
 
-    def _init_schema(self) -> None:
-        self.connection.executescript(
-            """
-            create table if not exists archive_object (
-              key text primary key,
-              kind text not null,
-              source_segment text not null,
-              row_count integer not null,
-              checksum_sha256 text not null,
-              min_event_ts_ms integer,
-              max_event_ts_ms integer,
-              created_at_ms integer not null
-            );
+    if args.command == "write":
+        run_writer(settings)
+        return 0
 
-            create table if not exists archive_health (
-              id integer primary key autoincrement,
-              event_type text not null,
-              severity text not null,
-              message text not null,
-              details_json text not null,
-              created_at_ms integer not null
-            );
-            """
-        )
+    if args.command == "validate-once":
+        report = validate_once(settings)
+        print(json.dumps(report, indent=2, sort_keys=True, default=str), flush=True)
+        return 0 if report.get("status") == "ok" else 1
+
+    if args.command == "validate-loop":
+        validate_loop(settings)
+        return 0
+
+    if args.command == "inspect":
+        metadata_store = MetadataStore(settings.metadata_db_path)
+        payload = {
+            "metadata_db_path": str(settings.metadata_db_path),
+            "object_count": metadata_store.object_count(),
+            "latest_objects": metadata_store.latest_objects(limit=20),
+            "latest_health": metadata_store.latest_health(limit=20),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str), flush=True)
+        return 0
+
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
