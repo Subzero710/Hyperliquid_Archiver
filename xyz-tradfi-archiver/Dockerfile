@@ -1,18 +1,20 @@
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONPATH=/app
 
 WORKDIR /app
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl \
-  && rm -rf /var/lib/apt/lists/*
+RUN python -m pip install \
+  --root-user-action=ignore \
+  "boto3>=1.34.0" \
+  "pyarrow>=16.0.0" \
+  "requests>=2.32.0" \
+  "websocket-client>=1.8.0" \
+  "zstandard>=0.22.0"
 
-COPY pyproject.toml /app/pyproject.toml
-COPY app /app/app
+COPY app ./app
 
-RUN pip install --no-cache-dir --upgrade pip \
-  && pip install --no-cache-dir .
-
-ENTRYPOINT ["xyz-archiver"]
+ENTRYPOINT ["python", "-m", "app.cli"]

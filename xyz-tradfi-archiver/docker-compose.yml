@@ -2,25 +2,34 @@ name: xyz-tradfi-archiver
 
 services:
   recorder:
-    build: .
+    build:
+      context: .
+      network: host
     command: ["record"]
     restart: unless-stopped
+    network_mode: host
     env_file: .env
     volumes:
       - archiver-state:/var/lib/xyz-tradfi-archiver
 
   writer:
-    build: .
+    build:
+      context: .
+      network: host
     command: ["write"]
     restart: unless-stopped
+    network_mode: host
     env_file: .env
     volumes:
       - archiver-state:/var/lib/xyz-tradfi-archiver
 
   validator:
-    build: .
+    build:
+      context: .
+      network: host
     command: ["validate-loop"]
     restart: unless-stopped
+    network_mode: host
     env_file: .env
     volumes:
       - archiver-state:/var/lib/xyz-tradfi-archiver

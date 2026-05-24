@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("inspect")
 
     args = parser.parse_args(argv)
-    settings = Settings()
+    settings = Settings.from_env()
 
     if args.command == "record":
         run_recorder(settings)
