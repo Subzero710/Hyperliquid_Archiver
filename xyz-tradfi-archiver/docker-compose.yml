@@ -9,6 +9,18 @@ services:
     restart: unless-stopped
     network_mode: host
     env_file: .env
+    init: true
+    read_only: true
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    cpus: "1.00"
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=256m,mode=1777
     volumes:
       - archiver-state:/var/lib/xyz-tradfi-archiver
     logging:
@@ -25,6 +37,18 @@ services:
     restart: unless-stopped
     network_mode: host
     env_file: .env
+    init: true
+    read_only: true
+    mem_limit: 3072m
+    memswap_limit: 3072m
+    cpus: "1.50"
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=1024m,mode=1777
     volumes:
       - archiver-state:/var/lib/xyz-tradfi-archiver
     logging:
@@ -41,6 +65,18 @@ services:
     restart: unless-stopped
     network_mode: host
     env_file: .env
+    init: true
+    read_only: true
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: "0.25"
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=128m,mode=1777
     volumes:
       - archiver-state:/var/lib/xyz-tradfi-archiver
     healthcheck:
