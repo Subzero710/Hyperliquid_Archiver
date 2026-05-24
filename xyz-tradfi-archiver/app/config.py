@@ -1,49 +1,116 @@
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+
+def _env(name: str, default: str | None = None) -> str:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        if default is None:
+            raise RuntimeError(f"missing required environment variable: {name}")
+        return default
+    return value
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+def _env_int(name: str, default: int) -> int:
+    value = _env(name, str(default))
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid integer environment variable: {name}={value}") from exc
 
-    archive_bucket: str = "xyz-tradfi-archive"
-    archive_s3_endpoint: str | None = "http://minio:9000"
-    archive_s3_access_key: str = "minioadmin"
-    archive_s3_secret_key: str = "minioadmin"
-    archive_s3_region: str = "us-east-1"
-    archive_s3_force_path_style: bool = True
 
-    archiver_state_dir: Path = Path("/var/lib/xyz-tradfi-archiver")
-    archiver_run_id: str = Field(default_factory=lambda: uuid4().hex)
+def _env_float(name: str, default: float) -> float:
+    value = _env(name, str(default))
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid float environment variable: {name}={value}") from exc
 
-    hyperliquid_base_url: str = "https://api.hyperliquid.xyz"
-    hyperliquid_websocket_url: str = "wss://api.hyperliquid.xyz/ws"
-    hyperliquid_dex: str = "xyz"
-    hyperliquid_symbol_allowlist: str = ""
-    hyperliquid_http_timeout_s: float = 10.0
 
-    archive_timeframes: str = "15m,4h,1d"
-    archive_candle_lookback_bars: int = 240
-    archive_funding_lookback_days: int = 7
+def _env_bool(name: str, default: bool) -> bool:
+    value = _env(name, "true" if default else "false").strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise RuntimeError(f"invalid boolean environment variable: {name}={value}")
 
-    recorder_fsync_every_events: int = 1
-    recorder_segment_max_bytes: int = 128 * 1024 * 1024
-    recorder_segment_max_age_seconds: int = 300
-    recorder_idle_sleep_seconds: float = 1.0
 
-    poll_perp_dexs_seconds: int = 3600
-    poll_meta_asset_ctxs_seconds: int = 30
-    poll_all_mids_seconds: int = 5
-    poll_l2_snapshot_seconds: int = 10
-    poll_funding_history_seconds: int = 900
-    poll_candles_seconds: int = 60
+@dataclass(frozen=True)
+class Settings:
+    archive_bucket: str
+    archive_s3_endpoint: str
+    archive_s3_access_key: str
+    archive_s3_secret_key: str
+    archive_s3_region: str
+    archive_s3_force_path_style: bool
+    archive_s3_verify_bucket: bool
 
-    writer_loop_sleep_seconds: float = 5.0
-    validator_loop_sleep_seconds: float = 60.0
+    archiver_state_dir: Path
+    archiver_run_id: str
+
+    hyperliquid_base_url: str
+    hyperliquid_websocket_url: str
+    hyperliquid_dex: str
+    hyperliquid_symbol_allowlist: str
+    hyperliquid_http_timeout_s: float
+
+    archive_timeframes: str
+    archive_candle_lookback_bars: int
+    archive_funding_lookback_days: int
+
+    recorder_fsync_every_events: int
+    recorder_segment_max_bytes: int
+    recorder_segment_max_age_seconds: int
+    recorder_idle_sleep_seconds: float
+
+    poll_perp_dexs_seconds: int
+    poll_meta_asset_ctxs_seconds: int
+    poll_all_mids_seconds: int
+    poll_l2_snapshot_seconds: int
+    poll_funding_history_seconds: int
+    poll_candles_seconds: int
+
+    writer_loop_sleep_seconds: float
+    validator_loop_sleep_seconds: float
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        return cls(
+            archive_bucket=_env("ARCHIVE_BUCKET"),
+            archive_s3_endpoint=_env("ARCHIVE_S3_ENDPOINT"),
+            archive_s3_access_key=_env("ARCHIVE_S3_ACCESS_KEY"),
+            archive_s3_secret_key=_env("ARCHIVE_S3_SECRET_KEY"),
+            archive_s3_region=_env("ARCHIVE_S3_REGION", "us-east-1"),
+            archive_s3_force_path_style=_env_bool("ARCHIVE_S3_FORCE_PATH_STYLE", True),
+            archive_s3_verify_bucket=_env_bool("ARCHIVE_S3_VERIFY_BUCKET", True),
+            archiver_state_dir=Path(_env("ARCHIVER_STATE_DIR", "/var/lib/xyz-tradfi-archiver")),
+            archiver_run_id=_env("ARCHIVER_RUN_ID", uuid4().hex),
+            hyperliquid_base_url=_env("HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz"),
+            hyperliquid_websocket_url=_env("HYPERLIQUID_WEBSOCKET_URL", "wss://api.hyperliquid.xyz/ws"),
+            hyperliquid_dex=_env("HYPERLIQUID_DEX", "xyz"),
+            hyperliquid_symbol_allowlist=_env("HYPERLIQUID_SYMBOL_ALLOWLIST", ""),
+            hyperliquid_http_timeout_s=_env_float("HYPERLIQUID_HTTP_TIMEOUT_S", 10.0),
+            archive_timeframes=_env("ARCHIVE_TIMEFRAMES", "15m,4h,1d"),
+            archive_candle_lookback_bars=_env_int("ARCHIVE_CANDLE_LOOKBACK_BARS", 240),
+            archive_funding_lookback_days=_env_int("ARCHIVE_FUNDING_LOOKBACK_DAYS", 7),
+            recorder_fsync_every_events=_env_int("RECORDER_FSYNC_EVERY_EVENTS", 1),
+            recorder_segment_max_bytes=_env_int("RECORDER_SEGMENT_MAX_BYTES", 134217728),
+            recorder_segment_max_age_seconds=_env_int("RECORDER_SEGMENT_MAX_AGE_SECONDS", 300),
+            recorder_idle_sleep_seconds=_env_float("RECORDER_IDLE_SLEEP_SECONDS", 1.0),
+            poll_perp_dexs_seconds=_env_int("POLL_PERP_DEXS_SECONDS", 3600),
+            poll_meta_asset_ctxs_seconds=_env_int("POLL_META_ASSET_CTXS_SECONDS", 30),
+            poll_all_mids_seconds=_env_int("POLL_ALL_MIDS_SECONDS", 5),
+            poll_l2_snapshot_seconds=_env_int("POLL_L2_SNAPSHOT_SECONDS", 10),
+            poll_funding_history_seconds=_env_int("POLL_FUNDING_HISTORY_SECONDS", 900),
+            poll_candles_seconds=_env_int("POLL_CANDLES_SECONDS", 60),
+            writer_loop_sleep_seconds=_env_float("WRITER_LOOP_SLEEP_SECONDS", 5.0),
+            validator_loop_sleep_seconds=_env_float("VALIDATOR_LOOP_SLEEP_SECONDS", 60.0),
+        )
 
     @property
     def spool_dir(self) -> Path:
