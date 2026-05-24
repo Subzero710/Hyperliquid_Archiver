@@ -33,10 +33,13 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_bool(name: str, default: bool) -> bool:
     value = _env(name, "true" if default else "false").strip().lower()
+
     if value in {"1", "true", "yes", "y", "on"}:
         return True
+
     if value in {"0", "false", "no", "n", "off"}:
         return False
+
     raise RuntimeError(f"invalid boolean environment variable: {name}={value}")
 
 
@@ -78,6 +81,14 @@ class Settings:
     writer_loop_sleep_seconds: float
     validator_loop_sleep_seconds: float
 
+    validator_startup_grace_seconds: int
+    validator_recorder_stale_seconds: int
+    validator_writer_stale_seconds: int
+    validator_max_sealed_segments: int
+    validator_max_failed_segments: int
+    validator_require_objects_after_grace: bool
+    validator_verify_object_store: bool
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -96,20 +107,27 @@ class Settings:
             hyperliquid_symbol_allowlist=_env("HYPERLIQUID_SYMBOL_ALLOWLIST", ""),
             hyperliquid_http_timeout_s=_env_float("HYPERLIQUID_HTTP_TIMEOUT_S", 10.0),
             archive_timeframes=_env("ARCHIVE_TIMEFRAMES", "15m,4h,1d"),
-            archive_candle_lookback_bars=_env_int("ARCHIVE_CANDLE_LOOKBACK_BARS", 240),
-            archive_funding_lookback_days=_env_int("ARCHIVE_FUNDING_LOOKBACK_DAYS", 7),
+            archive_candle_lookback_bars=_env_int("ARCHIVE_CANDLE_LOOKBACK_BARS", 8),
+            archive_funding_lookback_days=_env_int("ARCHIVE_FUNDING_LOOKBACK_DAYS", 2),
             recorder_fsync_every_events=_env_int("RECORDER_FSYNC_EVERY_EVENTS", 1),
             recorder_segment_max_bytes=_env_int("RECORDER_SEGMENT_MAX_BYTES", 134217728),
             recorder_segment_max_age_seconds=_env_int("RECORDER_SEGMENT_MAX_AGE_SECONDS", 300),
             recorder_idle_sleep_seconds=_env_float("RECORDER_IDLE_SLEEP_SECONDS", 1.0),
-            poll_perp_dexs_seconds=_env_int("POLL_PERP_DEXS_SECONDS", 3600),
-            poll_meta_asset_ctxs_seconds=_env_int("POLL_META_ASSET_CTXS_SECONDS", 30),
-            poll_all_mids_seconds=_env_int("POLL_ALL_MIDS_SECONDS", 5),
-            poll_l2_snapshot_seconds=_env_int("POLL_L2_SNAPSHOT_SECONDS", 10),
-            poll_funding_history_seconds=_env_int("POLL_FUNDING_HISTORY_SECONDS", 900),
-            poll_candles_seconds=_env_int("POLL_CANDLES_SECONDS", 60),
+            poll_perp_dexs_seconds=_env_int("POLL_PERP_DEXS_SECONDS", 21600),
+            poll_meta_asset_ctxs_seconds=_env_int("POLL_META_ASSET_CTXS_SECONDS", 300),
+            poll_all_mids_seconds=_env_int("POLL_ALL_MIDS_SECONDS", 60),
+            poll_l2_snapshot_seconds=_env_int("POLL_L2_SNAPSHOT_SECONDS", 300),
+            poll_funding_history_seconds=_env_int("POLL_FUNDING_HISTORY_SECONDS", 3600),
+            poll_candles_seconds=_env_int("POLL_CANDLES_SECONDS", 900),
             writer_loop_sleep_seconds=_env_float("WRITER_LOOP_SLEEP_SECONDS", 5.0),
             validator_loop_sleep_seconds=_env_float("VALIDATOR_LOOP_SLEEP_SECONDS", 60.0),
+            validator_startup_grace_seconds=_env_int("VALIDATOR_STARTUP_GRACE_SECONDS", 900),
+            validator_recorder_stale_seconds=_env_int("VALIDATOR_RECORDER_STALE_SECONDS", 180),
+            validator_writer_stale_seconds=_env_int("VALIDATOR_WRITER_STALE_SECONDS", 900),
+            validator_max_sealed_segments=_env_int("VALIDATOR_MAX_SEALED_SEGMENTS", 20),
+            validator_max_failed_segments=_env_int("VALIDATOR_MAX_FAILED_SEGMENTS", 0),
+            validator_require_objects_after_grace=_env_bool("VALIDATOR_REQUIRE_OBJECTS_AFTER_GRACE", True),
+            validator_verify_object_store=_env_bool("VALIDATOR_VERIFY_OBJECT_STORE", True),
         )
 
     @property
