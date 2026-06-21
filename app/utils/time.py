@@ -17,6 +17,17 @@ def date_hour_from_ms(timestamp_ms: int) -> tuple[str, str]:
     return dt.strftime("%Y-%m-%d"), dt.strftime("%H")
 
 
+def official_date_hour_from_ms(timestamp_ms: int) -> tuple[str, str]:
+    dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
+    return dt.strftime("%Y%m%d"), str(dt.hour)
+
+
+def is_timestamp_ms(value: object) -> bool:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    return 946684800000 <= value <= 4102444800000
+
+
 def interval_to_ms(interval: str) -> int:
     units = {
         "m": 60_000,

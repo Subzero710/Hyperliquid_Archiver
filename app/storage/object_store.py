@@ -11,9 +11,16 @@ from app.config import Settings
 
 class ObjectStore:
     def __init__(self, settings: Settings) -> None:
+        s3_options = {
+            "addressing_style": "path" if settings.archive_s3_force_path_style else "auto",
+            "payload_signing_enabled": False,
+        }
+
         s3_config = Config(
             signature_version="s3v4",
-            s3={"addressing_style": "path"} if settings.archive_s3_force_path_style else {},
+            s3=s3_options,
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
         )
 
         self.client = boto3.client(
@@ -37,11 +44,12 @@ class ObjectStore:
             raise RuntimeError(f"object store bucket is not reachable: {self.bucket}") from exc
 
     def put_file(self, *, key: str, path: Path, content_type: str) -> None:
-        self.client.upload_file(
-            str(path),
-            self.bucket,
-            key,
-            ExtraArgs={"ContentType": content_type},
+        data = path.read_bytes()
+
+        self.put_bytes(
+            key=key,
+            data=data,
+            content_type=content_type,
         )
 
     def put_bytes(self, *, key: str, data: bytes, content_type: str) -> None:
@@ -50,6 +58,7 @@ class ObjectStore:
             Key=key,
             Body=data,
             ContentType=content_type,
+            ContentLength=len(data),
         )
 
     def exists(self, *, key: str) -> bool:
