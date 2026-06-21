@@ -28,26 +28,32 @@ class HyperliquidWebSocketRecorder:
     _connected: bool = False
     _pending_symbols: set[str] = field(default_factory=set)
     _subscribed_l2: set[str] = field(default_factory=set)
-    _subscribed_trades: set[str] = field(default_factory=set)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run_forever, name="hyperliquid-ws-recorder", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run_forever,
+            name="hyperliquid-ws-recorder",
+            daemon=True,
+        )
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         ws = self._ws
+
         if ws is not None:
             ws.close()
 
     def ensure_subscriptions(self, symbols: list[str]) -> None:
         with self._lock:
             for symbol in symbols:
-                if symbol not in self._subscribed_l2 or symbol not in self._subscribed_trades:
+                if symbol not in self._subscribed_l2:
                     self._pending_symbols.add(symbol)
+
         self._flush_subscriptions()
 
     def _run_forever(self) -> None:
@@ -62,6 +68,7 @@ class HyperliquidWebSocketRecorder:
                 on_close=self._on_close,
             )
             self._ws.run_forever(ping_interval=20, ping_timeout=10)
+
             if not self._stop.is_set():
                 time.sleep(self.reconnect_sleep_s)
 
@@ -72,12 +79,17 @@ class HyperliquidWebSocketRecorder:
 
     def _on_close(self, ws: websocket.WebSocketApp, status_code: int, message: str) -> None:
         self._connected = False
-        self._emit_health("ws_close", {"status_code": status_code, "message": message})
+        self._emit_health(
+            "ws_close",
+            {
+                "status_code": status_code,
+                "message": message,
+            },
+        )
+
         with self._lock:
             self._pending_symbols.update(self._subscribed_l2)
-            self._pending_symbols.update(self._subscribed_trades)
             self._subscribed_l2.clear()
-            self._subscribed_trades.clear()
 
     def _on_error(self, ws: websocket.WebSocketApp, error: Exception) -> None:
         self._connected = False
@@ -103,62 +115,78 @@ class HyperliquidWebSocketRecorder:
         if channel == "l2Book" and isinstance(data, dict):
             coin = data.get("coin")
             if isinstance(coin, str):
-                self.emit(make_raw_event(run_id=self.run_id, dex=self.dex, datatype="ws_l2_book", symbol=coin, payload=data))
-            return
-
-        if channel == "trades" and isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                coin = item.get("coin")
-                if isinstance(coin, str):
-                    self.emit(make_raw_event(run_id=self.run_id, dex=self.dex, datatype="ws_trades", symbol=coin, payload=item))
+                self.emit(
+                    make_raw_event(
+                        run_id=self.run_id,
+                        dex=self.dex,
+                        datatype="ws_l2_book",
+                        symbol=coin,
+                        payload=data,
+                    )
+                )
             return
 
     def _handle_subscription_response(self, data: Any) -> None:
         if not isinstance(data, dict):
             return
+
         subscription = data.get("subscription")
         if not isinstance(subscription, dict):
             return
+
         coin = subscription.get("coin")
         sub_type = subscription.get("type")
+
         if not isinstance(coin, str):
             return
+
         with self._lock:
             if sub_type == "l2Book":
                 self._subscribed_l2.add(coin)
-            if sub_type == "trades":
-                self._subscribed_trades.add(coin)
-            if coin in self._subscribed_l2 and coin in self._subscribed_trades:
                 self._pending_symbols.discard(coin)
+
         self._emit_health("ws_subscription_response", data)
 
     def _flush_subscriptions(self) -> None:
         ws = self._ws
+
         if ws is None or not self._connected:
             return
+
         with self._lock:
             symbols = sorted(self._pending_symbols)
+
         for symbol in symbols:
-            l2_sent = self._subscribe(ws=ws, coin=symbol, sub_type="l2Book")
-            trades_sent = self._subscribe(ws=ws, coin=symbol, sub_type="trades")
+            sent = self._subscribe(ws=ws, coin=symbol)
+
             with self._lock:
-                if l2_sent:
+                if sent:
                     self._subscribed_l2.add(symbol)
-                if trades_sent:
-                    self._subscribed_trades.add(symbol)
-                if symbol in self._subscribed_l2 and symbol in self._subscribed_trades:
                     self._pending_symbols.discard(symbol)
 
-    def _subscribe(self, *, ws: websocket.WebSocketApp, coin: str, sub_type: str) -> bool:
-        payload = {"method": "subscribe", "subscription": {"type": sub_type, "coin": coin}}
+    def _subscribe(self, *, ws: websocket.WebSocketApp, coin: str) -> bool:
+        payload = {
+            "method": "subscribe",
+            "subscription": {
+                "type": "l2Book",
+                "coin": coin,
+            },
+        }
+
         try:
             ws.send(json.dumps(payload))
         except Exception as exc:
             self._connected = False
-            self._emit_health("ws_subscribe_error", {"coin": coin, "type": sub_type, "error": repr(exc)})
+            self._emit_health(
+                "ws_subscribe_error",
+                {
+                    "coin": coin,
+                    "type": "l2Book",
+                    "error": repr(exc),
+                },
+            )
             return False
+
         return True
 
     def _emit_health(self, event_type: str, payload: dict[str, Any]) -> None:
@@ -167,7 +195,10 @@ class HyperliquidWebSocketRecorder:
                 run_id=self.run_id,
                 dex=self.dex,
                 datatype="health",
-                payload={"event_type": event_type, "payload": payload},
+                payload={
+                    "event_type": event_type,
+                    "payload": payload,
+                },
                 event_ts_ms=now_ms(),
             )
         )

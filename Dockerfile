@@ -10,10 +10,9 @@ WORKDIR /app
 RUN python -m pip install \
   --root-user-action=ignore \
   "boto3>=1.34.0" \
-  "pyarrow>=16.0.0" \
+  "lz4>=4.3.3" \
   "requests>=2.32.0" \
-  "websocket-client>=1.8.0" \
-  "zstandard>=0.22.0"
+  "websocket-client>=1.8.0"
 
 COPY app ./app
 

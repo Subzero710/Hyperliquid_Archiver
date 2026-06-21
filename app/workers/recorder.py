@@ -12,7 +12,7 @@ from app.hyperliquid.driver import HyperliquidInfoDriver
 from app.hyperliquid.symbols import HyperliquidSymbol, discover_symbols
 from app.hyperliquid.websocket_recorder import HyperliquidWebSocketRecorder
 from app.spool.durable_spool import DurableSpool
-from app.utils.time import interval_to_ms, now_ms
+from app.utils.time import now_ms
 
 logger = logging.getLogger("xyz_archiver.recorder")
 
@@ -22,20 +22,23 @@ class PollSchedule:
     name: str
     every_s: int
     action: Callable[[], None]
-    next_at_ms: int = 0
+    next_at_ms: int
+
+    def __post_init__(self) -> None:
+        self.every_s = max(1, self.every_s)
+        self.next_at_ms = max(0, self.next_at_ms)
 
     def maybe_run(self, current_ms: int) -> bool:
         if current_ms < self.next_at_ms:
             return False
 
-        self.action()
         self.next_at_ms = current_ms + self.every_s * 1000
+        self.action()
         return True
 
 
-def _seconds_for_candle_interval(interval: str, minimum_seconds: int) -> int:
-    interval_seconds = interval_to_ms(interval) // 1000
-    return max(minimum_seconds, interval_seconds)
+def _delay_ms(*, current_ms: int, delay_s: int) -> int:
+    return current_ms + max(0, delay_s) * 1000
 
 
 def run_recorder(settings: Settings) -> None:
@@ -49,12 +52,11 @@ def run_recorder(settings: Settings) -> None:
     )
 
     logger.info(
-        "recorder_start run_id=%s dex=%s state_dir=%s spool_dir=%s timeframes=%s",
+        "recorder_start run_id=%s dex=%s state_dir=%s spool_dir=%s",
         settings.archiver_run_id,
         settings.hyperliquid_dex,
         settings.archiver_state_dir,
         settings.spool_dir,
-        ",".join(settings.timeframes),
     )
 
     logger.info(
@@ -92,26 +94,42 @@ def run_recorder(settings: Settings) -> None:
     ws_recorder.ensure_subscriptions(initial_symbols)
 
     logger.info(
-        "websocket_started url=%s subscriptions=%s",
+        "websocket_started url=%s l2_subscriptions=%s",
         settings.hyperliquid_websocket_url,
         len(initial_symbols),
     )
 
+    start_ms = now_ms()
     schedules: list[PollSchedule] = [
-        PollSchedule("perp_dexs", settings.poll_perp_dexs_seconds, state.poll_perp_dexs),
-        PollSchedule("meta_asset_ctxs", settings.poll_meta_asset_ctxs_seconds, state.poll_meta_asset_ctxs),
-        PollSchedule("all_mids", settings.poll_all_mids_seconds, state.poll_all_mids),
-        PollSchedule("l2_snapshot", settings.poll_l2_snapshot_seconds, state.poll_l2_snapshots),
-        PollSchedule("funding_history", settings.poll_funding_history_seconds, state.poll_funding_history),
+        PollSchedule(
+            name="meta_asset_ctxs",
+            every_s=settings.poll_meta_asset_ctxs_seconds,
+            action=state.poll_meta_asset_ctxs,
+            next_at_ms=start_ms,
+        ),
     ]
 
-    for interval in settings.timeframes:
+    if settings.archive_enable_l2_snapshots:
         schedules.append(
             PollSchedule(
-                name=f"candles_{interval}",
-                every_s=_seconds_for_candle_interval(interval, settings.poll_candles_seconds),
-                action=lambda interval=interval: state.poll_candles_interval(interval),
+                name="l2_snapshot",
+                every_s=settings.poll_l2_snapshot_seconds,
+                action=state.poll_l2_snapshots,
+                next_at_ms=_delay_ms(
+                    current_ms=start_ms,
+                    delay_s=settings.archive_startup_l2_delay_seconds,
+                ),
             )
+        )
+    else:
+        logger.info("poll_disabled datatype=l2_snapshot")
+
+    for schedule in schedules:
+        logger.info(
+            "poll_schedule name=%s every_s=%s next_at_ms=%s",
+            schedule.name,
+            schedule.every_s,
+            schedule.next_at_ms,
         )
 
     last_heartbeat_ms = 0
@@ -157,7 +175,6 @@ def run_recorder(settings: Settings) -> None:
                 last_heartbeat_ms = current_ms
 
             time.sleep(settings.recorder_idle_sleep_seconds)
-
     finally:
         logger.info("recorder_stopping")
         ws_recorder.stop()
@@ -210,22 +227,6 @@ class RecorderState:
 
         logger.info("symbols_refreshed count=%s", len(symbols))
 
-    def poll_perp_dexs(self) -> None:
-        payload = self.driver.perp_dexs()
-
-        self.spool.append(
-            make_raw_event(
-                run_id=self.settings.archiver_run_id,
-                dex=self.settings.hyperliquid_dex,
-                datatype="perp_dexs",
-                payload=payload,
-                event_ts_ms=now_ms(),
-            )
-        )
-
-        item_count = len(payload) if isinstance(payload, list) else None
-        logger.info("poll_ok datatype=perp_dexs items=%s", item_count)
-
     def poll_meta_asset_ctxs(self) -> None:
         symbols, meta, contexts = discover_symbols(
             driver=self.driver,
@@ -242,35 +243,22 @@ class RecorderState:
                 run_id=self.settings.archiver_run_id,
                 dex=self.settings.hyperliquid_dex,
                 datatype="meta_asset_ctxs",
-                payload={"meta": meta, "contexts": contexts},
+                payload={
+                    "meta": meta,
+                    "contexts": contexts,
+                },
                 event_ts_ms=now_ms(),
             )
         )
 
         logger.info("poll_ok datatype=meta_asset_ctxs symbols=%s", len(symbols))
 
-    def poll_all_mids(self) -> None:
-        payload = self.driver.all_mids()
-
-        self.spool.append(
-            make_raw_event(
-                run_id=self.settings.archiver_run_id,
-                dex=self.settings.hyperliquid_dex,
-                datatype="all_mids",
-                payload=payload,
-                event_ts_ms=now_ms(),
-            )
-        )
-
-        item_count = len(payload) if isinstance(payload, dict) else None
-        logger.info("poll_ok datatype=all_mids items=%s", item_count)
-
     def poll_l2_snapshots(self) -> None:
         symbols = self._symbols()
         success = 0
         failed = 0
 
-        for symbol in symbols:
+        for index, symbol in enumerate(symbols):
             try:
                 payload = self.driver.l2_snapshot(coin=symbol.name)
                 self.spool.append(
@@ -300,130 +288,15 @@ class RecorderState:
                         event_ts_ms=now_ms(),
                     )
                 )
+            finally:
+                self._sleep_between_symbol_requests(
+                    index=index,
+                    total=len(symbols),
+                    seconds=self.settings.archive_l2_request_sleep_seconds,
+                )
 
         logger.info(
             "poll_ok datatype=l2_snapshot symbols=%s success=%s failed=%s",
-            len(symbols),
-            success,
-            failed,
-        )
-
-    def poll_funding_history(self) -> None:
-        symbols = self._symbols()
-        end_ms = now_ms()
-        start_ms = end_ms - self.settings.archive_funding_lookback_days * 86_400_000
-        success = 0
-        failed = 0
-
-        for symbol in symbols:
-            try:
-                rows = self.driver.funding_history(
-                    coin=symbol.name,
-                    start_time_ms=start_ms,
-                    end_time_ms=end_ms,
-                )
-
-                self.spool.append(
-                    make_raw_event(
-                        run_id=self.settings.archiver_run_id,
-                        dex=self.settings.hyperliquid_dex,
-                        datatype="funding_history",
-                        symbol=symbol.name,
-                        payload={
-                            "start_time_ms": start_ms,
-                            "end_time_ms": end_ms,
-                            "rows": rows,
-                        },
-                        event_ts_ms=end_ms,
-                    )
-                )
-                success += 1
-            except Exception as exc:
-                failed += 1
-                logger.warning("funding_history_error symbol=%s error=%r", symbol.name, exc)
-                self.spool.append(
-                    make_raw_event(
-                        run_id=self.settings.archiver_run_id,
-                        dex=self.settings.hyperliquid_dex,
-                        datatype="health",
-                        symbol=symbol.name,
-                        payload={
-                            "event_type": "funding_history_error",
-                            "symbol": symbol.name,
-                            "error": repr(exc),
-                        },
-                        event_ts_ms=now_ms(),
-                    )
-                )
-
-        logger.info(
-            "poll_ok datatype=funding_history symbols=%s success=%s failed=%s",
-            len(symbols),
-            success,
-            failed,
-        )
-
-    def poll_candles_interval(self, interval: str) -> None:
-        symbols = self._symbols()
-        end_ms = now_ms()
-        start_ms = end_ms - interval_to_ms(interval) * self.settings.archive_candle_lookback_bars
-        success = 0
-        failed = 0
-
-        for symbol in symbols:
-            try:
-                rows = self.driver.candles_snapshot(
-                    coin=symbol.name,
-                    interval=interval,
-                    start_time_ms=start_ms,
-                    end_time_ms=end_ms,
-                )
-
-                self.spool.append(
-                    make_raw_event(
-                        run_id=self.settings.archiver_run_id,
-                        dex=self.settings.hyperliquid_dex,
-                        datatype="candles",
-                        symbol=symbol.name,
-                        interval=interval,
-                        payload={
-                            "interval": interval,
-                            "start_time_ms": start_ms,
-                            "end_time_ms": end_ms,
-                            "rows": rows,
-                        },
-                        event_ts_ms=end_ms,
-                    )
-                )
-                success += 1
-            except Exception as exc:
-                failed += 1
-                logger.warning(
-                    "candles_error symbol=%s interval=%s error=%r",
-                    symbol.name,
-                    interval,
-                    exc,
-                )
-                self.spool.append(
-                    make_raw_event(
-                        run_id=self.settings.archiver_run_id,
-                        dex=self.settings.hyperliquid_dex,
-                        datatype="health",
-                        symbol=symbol.name,
-                        interval=interval,
-                        payload={
-                            "event_type": "candles_error",
-                            "symbol": symbol.name,
-                            "interval": interval,
-                            "error": repr(exc),
-                        },
-                        event_ts_ms=now_ms(),
-                    )
-                )
-
-        logger.info(
-            "poll_ok datatype=candles interval=%s symbols=%s success=%s failed=%s",
-            interval,
             len(symbols),
             success,
             failed,
@@ -434,3 +307,13 @@ class RecorderState:
             self.refresh_symbols()
 
         return self.symbols or []
+
+    @staticmethod
+    def _sleep_between_symbol_requests(*, index: int, total: int, seconds: float) -> None:
+        if seconds <= 0:
+            return
+
+        if index >= total - 1:
+            return
+
+        time.sleep(seconds)

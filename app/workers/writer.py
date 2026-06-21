@@ -9,7 +9,6 @@ from app.storage.metadata_store import MetadataStore
 from app.storage.object_store import ObjectStore
 from app.utils.json import dumps
 from app.writers.brut_writer import BrutWriter
-from app.writers.parquet_writer import ParquetWriter
 
 logger = logging.getLogger("xyz_archiver.writer")
 
@@ -43,7 +42,10 @@ def run_writer(settings: Settings) -> None:
 
     metadata_store = MetadataStore(settings.metadata_db_path)
 
-    logger.info("metadata_store_ready db=%s", settings.metadata_db_path)
+    logger.info(
+        "metadata_store_ready db=%s",
+        settings.metadata_db_path,
+    )
 
     spool = DurableSpool(
         root=settings.spool_dir,
@@ -58,8 +60,10 @@ def run_writer(settings: Settings) -> None:
         spool.failed_dir,
     )
 
-    brut_writer = BrutWriter(object_store=object_store, metadata_store=metadata_store)
-    parquet_writer = ParquetWriter(object_store=object_store, metadata_store=metadata_store)
+    brut_writer = BrutWriter(
+        object_store=object_store,
+        metadata_store=metadata_store,
+    )
 
     last_idle_log_ms = 0
 
@@ -71,47 +75,67 @@ def run_writer(settings: Settings) -> None:
             current_ms = int(time.time() * 1000)
 
             if current_ms - last_idle_log_ms >= 30_000:
-                logger.info("writer_idle no_sealed_segments=true sealed_dir=%s", spool.sealed_dir)
+                logger.info(
+                    "writer_idle no_sealed_segments=true sealed_dir=%s",
+                    spool.sealed_dir,
+                )
                 last_idle_log_ms = current_ms
 
             time.sleep(settings.writer_loop_sleep_seconds)
             continue
 
-        logger.info("sealed_segments_found count=%s", len(segments))
+        logger.info(
+            "sealed_segments_found count=%s",
+            len(segments),
+        )
 
         for segment in segments:
             segment_uploaded = False
+            result = None
 
             try:
-                logger.info("segment_start path=%s", segment)
-
-                events = brut_writer.write_segment(segment)
-
                 logger.info(
-                    "segment_brut_done path=%s events=%s",
+                    "segment_start path=%s",
                     segment,
-                    len(events),
                 )
 
-                parquet_writer.write_events(events=events, source_segment=segment.name)
+                result = brut_writer.write_segment(segment)
 
                 logger.info(
-                    "segment_parquet_done path=%s events=%s",
+                    "segment_upload_done path=%s events=%s objects=%s skipped_events=%s",
                     segment,
-                    len(events),
+                    len(result.events),
+                    len(result.objects),
+                    result.skipped_events,
                 )
+
+                for obj in result.objects:
+                    logger.info(
+                        "official_object_written key=%s kind=%s rows=%s min_event_ts_ms=%s max_event_ts_ms=%s",
+                        obj.key,
+                        obj.kind,
+                        obj.row_count,
+                        obj.min_event_ts_ms,
+                        obj.max_event_ts_ms,
+                    )
 
                 segment_uploaded = True
                 wrote_any = True
-
             except Exception as exc:
-                logger.exception("segment_error path=%s", segment)
+                logger.exception(
+                    "segment_error path=%s",
+                    segment,
+                )
 
                 metadata_store.record_health(
                     event_type="writer_error",
                     severity="error",
                     message=repr(exc),
-                    details_json=dumps({"segment": str(segment)}),
+                    details_json=dumps(
+                        {
+                            "segment": str(segment),
+                        }
+                    ),
                 )
 
                 failed_path = spool.mark_failed(segment)
@@ -130,19 +154,26 @@ def run_writer(settings: Settings) -> None:
                 spool.delete_processed(segment)
 
                 logger.info(
-                    "segment_cleaned source=%s events=%s",
+                    "segment_cleaned source=%s events=%s objects=%s",
                     segment,
-                    len(events),
+                    len(result.events) if result is not None else 0,
+                    len(result.objects) if result is not None else 0,
                 )
-
             except Exception as exc:
-                logger.exception("segment_cleanup_error path=%s", segment)
+                logger.exception(
+                    "segment_cleanup_error path=%s",
+                    segment,
+                )
 
                 metadata_store.record_health(
                     event_type="segment_cleanup_error",
                     severity="error",
                     message=repr(exc),
-                    details_json=dumps({"segment": str(segment)}),
+                    details_json=dumps(
+                        {
+                            "segment": str(segment),
+                        }
+                    ),
                 )
 
                 done_path = spool.mark_done(segment)
