@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ class DurableSpool:
         self.sealed_dir = root / "sealed"
         self.done_dir = root / "done"
         self.failed_dir = root / "failed"
+        self.quarantine_dir = root / "quarantine"
         self.fsync_every_events = max(1, fsync_every_events)
         self.segment_max_bytes = segment_max_bytes
         self.segment_max_age_seconds = segment_max_age_seconds
@@ -30,10 +32,11 @@ class DurableSpool:
         self._current_started_ms: int | None = None
         self._events_since_fsync = 0
 
-        for directory in (self.open_dir, self.sealed_dir, self.done_dir, self.failed_dir):
+        for directory in (self.open_dir, self.sealed_dir, self.done_dir, self.failed_dir, self.quarantine_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
     def append(self, event: RawEvent) -> None:
+        self._assert_disk_reserve()
         self._ensure_current_file()
 
         assert self._current_file is not None
@@ -64,12 +67,69 @@ class DurableSpool:
         self._current_started_ms = None
         self._events_since_fsync = 0
 
+    def recover_orphaned_open_segments(self) -> list[Path]:
+        recovered: list[Path] = []
+        for source in sorted(self.open_dir.glob("*.open.jsonl")):
+            if source.stat().st_size <= 0:
+                source.unlink()
+                continue
+            destination = self.sealed_dir / source.name.replace(".open.jsonl", ".sealed.jsonl")
+            if destination.exists():
+                raise RuntimeError(f"cannot recover open segment; destination exists: {destination}")
+            os.replace(source, destination)
+            recovered.append(destination)
+
+        if recovered:
+            self._fsync_dir(self.open_dir)
+            self._fsync_dir(self.sealed_dir)
+        return recovered
+
     def sealed_segments(self) -> list[Path]:
         return sorted(self.sealed_dir.glob("*.sealed.jsonl"))
+
+    def failed_segments(self) -> list[Path]:
+        return sorted(self.failed_dir.glob("*.failed.jsonl"))
+
+    def done_segments(self) -> list[Path]:
+        return sorted(self.done_dir.glob("*.done.jsonl"))
+
+    def quarantine_segments(self) -> list[Path]:
+        return sorted(self.quarantine_dir.glob("*.quarantine.jsonl"))
 
     def delete_processed(self, segment: Path) -> None:
         segment.unlink()
         self._fsync_dir(segment.parent)
+
+    def delete_failed(self, segment: Path) -> None:
+        segment.unlink()
+        self._fsync_dir(segment.parent)
+
+    def cleanup_done_segments(self) -> int:
+        removed = 0
+        for segment in self.done_segments():
+            segment.unlink()
+            removed += 1
+        if removed:
+            self._fsync_dir(self.done_dir)
+        return removed
+
+    def requeue_failed(self, segment: Path) -> Path:
+        destination = self.sealed_dir / segment.name.replace(".failed.jsonl", ".sealed.jsonl")
+        if destination.exists():
+            raise RuntimeError(f"cannot requeue failed segment; destination exists: {destination}")
+        os.replace(segment, destination)
+        self._fsync_dir(self.failed_dir)
+        self._fsync_dir(self.sealed_dir)
+        return destination
+
+    def quarantine_failed(self, segment: Path) -> Path:
+        destination = self.quarantine_dir / segment.name.replace(".failed.jsonl", ".quarantine.jsonl")
+        if destination.exists():
+            raise RuntimeError(f"cannot quarantine failed segment; destination exists: {destination}")
+        os.replace(segment, destination)
+        self._fsync_dir(self.failed_dir)
+        self._fsync_dir(self.quarantine_dir)
+        return destination
 
     def mark_done(self, segment: Path) -> Path:
         self.done_dir.mkdir(parents=True, exist_ok=True)
@@ -86,6 +146,16 @@ class DurableSpool:
         self._fsync_dir(self.sealed_dir)
         self._fsync_dir(self.failed_dir)
         return destination
+
+    def active_source_segments(self) -> set[str]:
+        names: set[str] = set()
+        for path in self.sealed_segments():
+            names.add(path.name)
+        for path in self.failed_segments():
+            names.add(path.name.replace(".failed.jsonl", ".sealed.jsonl"))
+        for path in self.done_segments():
+            names.add(path.name.replace(".done.jsonl", ".sealed.jsonl"))
+        return names
 
     def _ensure_current_file(self) -> None:
         if self._current_file is not None:
@@ -120,7 +190,16 @@ class DurableSpool:
         age_s = (now_ms() - self._current_started_ms) / 1000
         return age_s >= self.segment_max_age_seconds
 
-    def _fsync_dir(self, directory: Path) -> None:
+    def _assert_disk_reserve(self) -> None:
+        free_bytes = shutil.disk_usage(self.root).free
+        if free_bytes <= self.segment_max_bytes:
+            raise RuntimeError(
+                "spool disk reserve breached "
+                f"free_bytes={free_bytes} reserve_bytes={self.segment_max_bytes} root={self.root}"
+            )
+
+    @staticmethod
+    def _fsync_dir(directory: Path) -> None:
         fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(fd)

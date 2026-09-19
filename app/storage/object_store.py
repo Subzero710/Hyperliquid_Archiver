@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 
 import boto3
@@ -44,12 +45,11 @@ class ObjectStore:
             raise RuntimeError(f"object store bucket is not reachable: {self.bucket}") from exc
 
     def put_file(self, *, key: str, path: Path, content_type: str) -> None:
-        data = path.read_bytes()
-
-        self.put_bytes(
-            key=key,
-            data=data,
-            content_type=content_type,
+        self.client.upload_file(
+            str(path),
+            self.bucket,
+            key,
+            ExtraArgs={"ContentType": content_type},
         )
 
     def put_bytes(self, *, key: str, data: bytes, content_type: str) -> None:
@@ -61,9 +61,33 @@ class ObjectStore:
             ContentLength=len(data),
         )
 
+    def download_file(self, *, key: str, path: Path) -> None:
+        self.client.download_file(self.bucket, key, str(path))
+
+    def checksum_sha256(self, *, key: str) -> str | None:
+        if not self.exists(key=key):
+            return None
+
+        response = self.client.get_object(Bucket=self.bucket, Key=key)
+        body = response["Body"]
+        hasher = sha256()
+        try:
+            while True:
+                chunk = body.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        finally:
+            body.close()
+        return hasher.hexdigest()
+
     def exists(self, *, key: str) -> bool:
         try:
             self.client.head_object(Bucket=self.bucket, Key=key)
             return True
-        except ClientError:
-            return False
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status == 404 or code in {"404", "NoSuchKey", "NotFound"}:
+                return False
+            raise

@@ -51,6 +51,14 @@ def run_recorder(settings: Settings) -> None:
         segment_max_age_seconds=settings.recorder_segment_max_age_seconds,
     )
 
+    recovered_open = spool.recover_orphaned_open_segments()
+    if recovered_open:
+        logger.warning(
+            "orphaned_open_segments_recovered count=%s files=%s",
+            len(recovered_open),
+            [str(path) for path in recovered_open],
+        )
+
     logger.info(
         "recorder_start run_id=%s dex=%s state_dir=%s spool_dir=%s",
         settings.archiver_run_id,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -23,11 +24,13 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
     sealed_dir = spool_dir / "sealed"
     done_dir = spool_dir / "done"
     failed_dir = spool_dir / "failed"
+    quarantine_dir = spool_dir / "quarantine"
 
     open_segments = _list_files(open_dir)
     sealed_segments = _list_files(sealed_dir)
     done_segments = _list_files(done_dir)
     failed_segments = _list_files(failed_dir)
+    quarantine_segments = _list_files(quarantine_dir)
 
     checks: list[dict[str, Any]] = []
 
@@ -49,6 +52,7 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
     object_count = 0
     latest_objects: list[dict[str, Any]] = []
     latest_health: list[dict[str, Any]] = []
+    metadata_store: MetadataStore | None = None
 
     try:
         metadata_store = MetadataStore(settings.metadata_db_path)
@@ -66,6 +70,16 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
         )
 
     failed_segments_count = len(failed_segments)
+    if quarantine_segments:
+        checks.append(
+            {
+                "name": "quarantined_historical_segments",
+                "status": "warning",
+                "count": len(quarantine_segments),
+                "files": [str(path) for path in quarantine_segments[:10]],
+            }
+        )
+
     if failed_segments_count > settings.validator_max_failed_segments:
         checks.append(
             {
@@ -132,6 +146,19 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
             }
         )
 
+    disk = shutil.disk_usage(settings.archiver_state_dir)
+    disk_reserve_bytes = settings.recorder_segment_max_bytes
+    if disk.free <= disk_reserve_bytes:
+        checks.append(
+            {
+                "name": "disk_reserve",
+                "status": "error",
+                "free_bytes": disk.free,
+                "reserve_bytes": disk_reserve_bytes,
+                "total_bytes": disk.total,
+            }
+        )
+
     errors = [check for check in checks if check.get("status") == "error"]
     status = "ok" if not errors and metadata_ok and object_store_ok else "error"
 
@@ -141,11 +168,18 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
         "object_store_ok": object_store_ok,
         "metadata_ok": metadata_ok,
         "object_count": object_count,
+        "disk": {
+            "total_bytes": disk.total,
+            "used_bytes": disk.used,
+            "free_bytes": disk.free,
+            "reserve_bytes": disk_reserve_bytes,
+        },
         "spool": {
             "open": len(open_segments),
             "sealed": len(sealed_segments),
             "done": len(done_segments),
             "failed": len(failed_segments),
+            "quarantine": len(quarantine_segments),
             "oldest_sealed_age_s": oldest_sealed_age_s,
             "newest_open_age_s": newest_open_age_s,
         },
@@ -154,25 +188,40 @@ def validate_once(settings: Settings, *, started_at_s: float | None = None) -> d
         "latest_health": latest_health,
     }
 
-    if metadata_ok:
+    if metadata_store is not None:
         try:
-            metadata_store.record_health(
-                event_type="validator_report",
-                severity="info" if status == "ok" else "error",
-                message=f"validator status={status}",
-                details_json=json.dumps(report, sort_keys=True, default=str),
-            )
+            if status != "ok":
+                compact_report = {
+                    "status": status,
+                    "runtime_s": runtime_s,
+                    "object_store_ok": object_store_ok,
+                    "metadata_ok": metadata_ok,
+                    "object_count": object_count,
+                    "disk": report["disk"],
+                    "spool": report["spool"],
+                    "checks": checks,
+                }
+                metadata_store.record_health(
+                    event_type="validator_error",
+                    severity="error",
+                    message="validator status=error",
+                    details_json=json.dumps(compact_report, sort_keys=True, default=str),
+                )
         except Exception:
             logger.exception("validator_record_health_error")
+        finally:
+            metadata_store.close()
 
     if status == "ok":
         logger.info(
-            "validator_ok object_count=%s open=%s sealed=%s done=%s failed=%s",
+            "validator_ok object_count=%s open=%s sealed=%s done=%s failed=%s quarantine=%s free_bytes=%s",
             object_count,
             len(open_segments),
             len(sealed_segments),
             len(done_segments),
             len(failed_segments),
+            len(quarantine_segments),
+            disk.free,
         )
     else:
         logger.error("validator_error report=%s", json.dumps(report, sort_keys=True, default=str))

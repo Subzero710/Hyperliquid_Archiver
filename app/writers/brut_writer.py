@@ -4,6 +4,9 @@ import csv
 import hashlib
 import json
 import os
+import shutil
+from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,9 +18,10 @@ from app.domain.events import RawEvent
 from app.storage.metadata_store import MetadataStore
 from app.storage.object_store import ObjectStore
 from app.utils.json import loads
-from app.utils.time import is_timestamp_ms, official_date_hour_from_ms
+from app.utils.time import is_timestamp_ms, now_ms, official_date_hour_from_ms
 
 OfficialKind = Literal["market_data_l2_book", "asset_ctxs"]
+FailedSegmentState = Literal["already_archived", "not_archived", "partial"]
 
 _ASSET_CTXS_COLUMNS = (
     "time",
@@ -87,11 +91,74 @@ class BrutWriter:
             result = self._write_object_group(rows=rows, source_segment=segment.name)
             written.append(result)
 
+        self.prune_rollups()
+
         return SegmentWriteResult(
             events=events,
             objects=written,
             skipped_events=skipped_events,
         )
+
+    def classify_failed_segment(self, segment: Path) -> FailedSegmentState:
+        events = self._read_events(segment)
+        if not events:
+            raise RuntimeError(f"failed segment contains no events: {segment}")
+
+        grouped, _ = self._group_events(events)
+        if not grouped:
+            return "already_archived"
+
+        any_present = False
+        any_missing = False
+
+        for rows in grouped.values():
+            required = Counter(rows.rows)
+            remote = self._remote_line_counts(key=rows.key)
+
+            for line, count in required.items():
+                present = remote.get(line, 0)
+                if present > 0:
+                    any_present = True
+                if present < count:
+                    any_missing = True
+
+        if any_present and any_missing:
+            return "partial"
+        if any_present:
+            return "already_archived"
+        return "not_archived"
+
+    def prune_rollups(self, *, reference_ms: int | None = None) -> int:
+        reference_ms = now_ms() if reference_ms is None else reference_ms
+        current_date, current_hour = official_date_hour_from_ms(reference_ms)
+
+        removed = self.metadata_store.prune_archive_objects(
+            current_date=current_date,
+            current_hour=current_hour,
+        )
+
+        if not self.rollup_root.exists():
+            return removed
+
+        for key_dir in list(self.rollup_root.iterdir()):
+            if not key_dir.is_dir():
+                continue
+
+            key_path = key_dir / "key.txt"
+            try:
+                key = key_path.read_text(encoding="utf-8").strip()
+            except (FileNotFoundError, OSError, UnicodeError):
+                key = ""
+
+            if self._keep_rollup_key(key=key, current_date=current_date, current_hour=current_hour):
+                continue
+
+            shutil.rmtree(key_dir)
+            removed += 1
+
+        if removed:
+            self._fsync_dir(self.rollup_root)
+        return removed
 
     def _read_events(self, segment: Path) -> list[RawEvent]:
         events: list[RawEvent] = []
@@ -103,12 +170,18 @@ class BrutWriter:
                 if not line:
                     continue
 
-                payload = loads(line)
+                try:
+                    payload = loads(line)
+                except Exception as exc:
+                    raise RuntimeError(f"invalid JSON at {segment}:{line_number}") from exc
 
                 if not isinstance(payload, dict):
                     raise RuntimeError(f"invalid raw event at {segment}:{line_number}")
 
-                events.append(RawEvent(**payload))
+                try:
+                    events.append(RawEvent(**payload))
+                except Exception as exc:
+                    raise RuntimeError(f"invalid raw event schema at {segment}:{line_number}") from exc
 
         return events
 
@@ -204,7 +277,14 @@ class BrutWriter:
             if not isinstance(coin, str) or not coin:
                 raise RuntimeError("meta_asset_ctxs universe entry missing name")
 
-            rows.append(self._asset_ctx_csv_row(event_ts_ms=event.event_ts_ms, index=index, item=item, context=context))
+            rows.append(
+                self._asset_ctx_csv_row(
+                    event_ts_ms=event.event_ts_ms,
+                    index=index,
+                    item=item,
+                    context=context,
+                )
+            )
 
         return _OfficialRows(
             key=key,
@@ -250,6 +330,23 @@ class BrutWriter:
         return self._csv_line([values[column] for column in _ASSET_CTXS_COLUMNS]).encode("utf-8")
 
     def _write_object_group(self, *, rows: _OfficialRows, source_segment: str) -> OfficialObjectWrite:
+        transaction = self.metadata_store.get_segment_object(
+            source_segment=source_segment,
+            object_key=rows.key,
+        )
+
+        if transaction is not None and transaction["status"] == "applied":
+            return self._object_write_from_transaction(transaction)
+
+        if transaction is not None and transaction["status"] == "pending":
+            remote_checksum = self.object_store.checksum_sha256(key=rows.key)
+            if remote_checksum == transaction["checksum_sha256"]:
+                completed = self.metadata_store.complete_segment_object(
+                    source_segment=source_segment,
+                    object_key=rows.key,
+                )
+                return self._object_write_from_transaction(completed)
+
         key_dir = self._key_dir(rows.key)
         segments_dir = key_dir / "segments"
 
@@ -269,30 +366,27 @@ class BrutWriter:
             stats = self._write_lz4_object(kind=rows.kind, key_dir=key_dir, output_path=object_path)
             checksum = self._sha256_file(object_path)
 
+            self.metadata_store.begin_segment_object(
+                source_segment=source_segment,
+                object_key=rows.key,
+                kind=rows.kind,
+                row_count=stats["row_count"],
+                checksum_sha256=checksum,
+                min_event_ts_ms=stats["min_event_ts_ms"],
+                max_event_ts_ms=stats["max_event_ts_ms"],
+            )
+
             self.object_store.put_file(
                 key=rows.key,
                 path=object_path,
                 content_type="application/x-lz4",
             )
 
-        self.metadata_store.record_object(
-            key=rows.key,
-            kind=rows.kind,
+        completed = self.metadata_store.complete_segment_object(
             source_segment=source_segment,
-            row_count=stats["row_count"],
-            checksum_sha256=checksum,
-            min_event_ts_ms=stats["min_event_ts_ms"],
-            max_event_ts_ms=stats["max_event_ts_ms"],
+            object_key=rows.key,
         )
-
-        return OfficialObjectWrite(
-            key=rows.key,
-            kind=rows.kind,
-            row_count=stats["row_count"],
-            checksum_sha256=checksum,
-            min_event_ts_ms=stats["min_event_ts_ms"],
-            max_event_ts_ms=stats["max_event_ts_ms"],
-        )
+        return self._object_write_from_transaction(completed)
 
     def _initialize_rollup_dir(self, *, key: str, kind: OfficialKind, key_dir: Path) -> None:
         marker = key_dir / "initialized"
@@ -308,7 +402,7 @@ class BrutWriter:
             with TemporaryDirectory() as tmp_dir_raw:
                 tmp_dir = Path(tmp_dir_raw)
                 compressed = tmp_dir / "remote.lz4"
-                self.object_store.client.download_file(self.object_store.bucket, key, str(compressed))
+                self.object_store.download_file(key=key, path=compressed)
 
                 base_path = key_dir / ("base.csv" if kind == "asset_ctxs" else "base.jsonl")
                 self._decompress_lz4_file(input_path=compressed, output_path=base_path)
@@ -365,19 +459,33 @@ class BrutWriter:
             "max_event_ts_ms": max_event_ts_ms,
         }
 
-    def _iter_rollup_lines(self, *, key_dir: Path) -> list[bytes]:
-        lines: list[bytes] = []
-
+    def _iter_rollup_lines(self, *, key_dir: Path) -> Iterator[bytes]:
         for base_name in ("base.jsonl", "base.csv"):
             base_path = key_dir / base_name
             if base_path.exists():
-                lines.extend(base_path.read_bytes().splitlines(keepends=True))
+                with base_path.open("rb") as handle:
+                    yield from handle
 
         segments_dir = key_dir / "segments"
         for segment_path in sorted(segments_dir.glob("*.rows")):
-            lines.extend(segment_path.read_bytes().splitlines(keepends=True))
+            with segment_path.open("rb") as handle:
+                yield from handle
 
-        return lines
+    def _remote_line_counts(self, *, key: str) -> Counter[bytes]:
+        if not self.object_store.exists(key=key):
+            return Counter()
+
+        with TemporaryDirectory() as tmp_dir_raw:
+            tmp_dir = Path(tmp_dir_raw)
+            compressed = tmp_dir / "remote.lz4"
+            self.object_store.download_file(key=key, path=compressed)
+            counts: Counter[bytes] = Counter()
+            with compressed.open("rb") as raw_input:
+                with lz4.frame.open(raw_input, mode="rb") as decompressed:
+                    for line in decompressed:
+                        if line.strip():
+                            counts[line] += 1
+            return counts
 
     def _timestamp_from_official_line(self, *, kind: OfficialKind, line: bytes) -> int | None:
         if kind == "market_data_l2_book":
@@ -475,6 +583,26 @@ class BrutWriter:
 
     def _key_dir(self, key: str) -> Path:
         return self.rollup_root / hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _keep_rollup_key(*, key: str, current_date: str, current_hour: str) -> bool:
+        if key.startswith("market_data/"):
+            parts = key.split("/")
+            return len(parts) >= 5 and parts[1] == current_date and parts[2] == current_hour
+        if key.startswith("asset_ctxs/"):
+            return key == f"asset_ctxs/{current_date}.csv.lz4"
+        return False
+
+    @staticmethod
+    def _object_write_from_transaction(transaction: dict[str, Any]) -> OfficialObjectWrite:
+        return OfficialObjectWrite(
+            key=str(transaction["object_key"]),
+            kind=str(transaction["kind"]),  # type: ignore[arg-type]
+            row_count=int(transaction["row_count"]),
+            checksum_sha256=str(transaction["checksum_sha256"]),
+            min_event_ts_ms=int(transaction["min_event_ts_ms"]),
+            max_event_ts_ms=int(transaction["max_event_ts_ms"]),
+        )
 
     @staticmethod
     def _write_text_if_absent(path: Path, text: str) -> None:

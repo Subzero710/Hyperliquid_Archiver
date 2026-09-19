@@ -124,40 +124,40 @@ def validate_latest_object(*, key: str | None) -> ValidationResult:
     metadata_store = MetadataStore(settings.metadata_db_path)
 
     try:
+        object_record: dict[str, Any] | None
         if key is None:
             latest_objects = metadata_store.latest_objects(limit=1)
             if not latest_objects:
-                raise RuntimeError("metadata store contains no archived object")
+                raise RuntimeError("metadata store contains no active archived object")
             object_record = latest_objects[0]
+            object_key = str(object_record["key"])
         else:
+            object_key = key
             object_record = _object_record_by_key(metadata_store, key=key)
 
-        object_key = str(object_record["key"])
         object_kind = _official_object_kind_from_key(object_key)
 
-        expected_kind = str(object_record["kind"])
-        if expected_kind != object_kind:
-            raise RuntimeError(
-                f"metadata kind mismatch key={object_key} metadata={expected_kind} actual={object_kind}"
-            )
+        if object_record is not None:
+            expected_kind = str(object_record["kind"])
+            if expected_kind != object_kind:
+                raise RuntimeError(
+                    f"metadata kind mismatch key={object_key} metadata={expected_kind} actual={object_kind}"
+                )
 
         object_store = ObjectStore(settings)
 
         with TemporaryDirectory() as tmp_raw:
             local_path = Path(tmp_raw) / "object.lz4"
-            object_store.client.download_file(
-                settings.archive_bucket,
-                object_key,
-                str(local_path),
-            )
+            object_store.download_file(key=object_key, path=local_path)
 
             checksum = _sha256_file(local_path)
-            expected_checksum = str(object_record["checksum_sha256"])
-            if checksum != expected_checksum:
-                raise RuntimeError(
-                    f"object checksum mismatch key={object_key} "
-                    f"expected={expected_checksum} actual={checksum}"
-                )
+            if object_record is not None:
+                expected_checksum = str(object_record["checksum_sha256"])
+                if checksum != expected_checksum:
+                    raise RuntimeError(
+                        f"object checksum mismatch key={object_key} "
+                        f"expected={expected_checksum} actual={checksum}"
+                    )
 
             raw_payload = _read_lz4_file(local_path)
 
@@ -168,42 +168,46 @@ def validate_latest_object(*, key: str | None) -> ValidationResult:
         else:
             raise RuntimeError(f"unhandled official object kind: {object_kind}")
 
-        row_count = int(object_record["row_count"])
-        min_event_ts_ms = int(object_record["min_event_ts_ms"])
-        max_event_ts_ms = int(object_record["max_event_ts_ms"])
+        if object_record is not None:
+            row_count = int(object_record["row_count"])
+            min_event_ts_ms = int(object_record["min_event_ts_ms"])
+            max_event_ts_ms = int(object_record["max_event_ts_ms"])
 
-        if result.row_count != row_count:
-            raise RuntimeError(
-                f"row_count mismatch key={object_key} metadata={row_count} actual={result.row_count}"
-            )
+            if result.row_count != row_count:
+                raise RuntimeError(
+                    f"row_count mismatch key={object_key} metadata={row_count} actual={result.row_count}"
+                )
 
-        if result.min_event_ts_ms != min_event_ts_ms:
-            raise RuntimeError(
-                f"min_event_ts_ms mismatch key={object_key} "
-                f"metadata={min_event_ts_ms} actual={result.min_event_ts_ms}"
-            )
+            if result.min_event_ts_ms != min_event_ts_ms:
+                raise RuntimeError(
+                    f"min_event_ts_ms mismatch key={object_key} "
+                    f"metadata={min_event_ts_ms} actual={result.min_event_ts_ms}"
+                )
 
-        if result.max_event_ts_ms != max_event_ts_ms:
-            raise RuntimeError(
-                f"max_event_ts_ms mismatch key={object_key} "
-                f"metadata={max_event_ts_ms} actual={result.max_event_ts_ms}"
-            )
+            if result.max_event_ts_ms != max_event_ts_ms:
+                raise RuntimeError(
+                    f"max_event_ts_ms mismatch key={object_key} "
+                    f"metadata={max_event_ts_ms} actual={result.max_event_ts_ms}"
+                )
 
-        return result
+        return ValidationResult(
+            source=result.source,
+            kind=result.kind,
+            row_count=result.row_count,
+            min_event_ts_ms=result.min_event_ts_ms,
+            max_event_ts_ms=result.max_event_ts_ms,
+            details={**result.details, "metadata_validated": object_record is not None},
+        )
     finally:
         metadata_store.close()
 
 
-def _object_record_by_key(metadata_store: MetadataStore, *, key: str) -> dict[str, Any]:
-    rows = metadata_store.connection.execute(
+def _object_record_by_key(metadata_store: MetadataStore, *, key: str) -> dict[str, Any] | None:
+    row = metadata_store.connection.execute(
         "select * from archive_object where key = ?",
         (key,),
-    ).fetchall()
-
-    if not rows:
-        raise RuntimeError(f"metadata store does not contain object key: {key}")
-
-    return dict(rows[0])
+    ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def _official_object_kind_from_key(key: str) -> OfficialObjectKind:

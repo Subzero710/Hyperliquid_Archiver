@@ -8,9 +8,11 @@ import sys
 from app.config import Settings
 from app.logging_config import configure_logging
 from app.storage.metadata_store import MetadataStore
+from app.storage.object_store import ObjectStore
 from app.workers.recorder import run_recorder
 from app.workers.validator import validate_loop, validate_once
 from app.workers.writer import run_writer
+from app.writers.brut_writer import BrutWriter
 
 logger = logging.getLogger("xyz_archiver.cli")
 
@@ -26,6 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("validate-once")
     subparsers.add_parser("validate-loop")
     subparsers.add_parser("inspect")
+    subparsers.add_parser("maintenance")
 
     args = parser.parse_args(argv)
     settings = Settings.from_env()
@@ -59,13 +62,38 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "inspect":
         metadata_store = MetadataStore(settings.metadata_db_path)
-        payload = {
-            "metadata_db_path": str(settings.metadata_db_path),
-            "object_count": metadata_store.object_count(),
-            "latest_objects": metadata_store.latest_objects(limit=20),
-            "latest_health": metadata_store.latest_health(limit=20),
-        }
-        print(json.dumps(payload, indent=2, sort_keys=True, default=str), flush=True)
+        try:
+            payload = {
+                "metadata_db_path": str(settings.metadata_db_path),
+                "object_count": metadata_store.object_count(),
+                "latest_objects": metadata_store.latest_objects(limit=20),
+                "latest_health": metadata_store.latest_health(limit=20),
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True, default=str), flush=True)
+        finally:
+            metadata_store.close()
+        return 0
+
+    if args.command == "maintenance":
+        before_bytes = settings.metadata_db_path.stat().st_size if settings.metadata_db_path.exists() else 0
+        metadata_store = MetadataStore(settings.metadata_db_path)
+        try:
+            brut_writer = BrutWriter(
+                object_store=ObjectStore(settings),
+                metadata_store=metadata_store,
+            )
+            pruned_rollup_state = brut_writer.prune_rollups()
+            metadata_store.vacuum()
+            after_bytes = settings.metadata_db_path.stat().st_size if settings.metadata_db_path.exists() else 0
+            payload = {
+                "metadata_db_path": str(settings.metadata_db_path),
+                "metadata_before_bytes": before_bytes,
+                "metadata_after_bytes": after_bytes,
+                "pruned_rollup_state": pruned_rollup_state,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+        finally:
+            metadata_store.close()
         return 0
 
     return 2
